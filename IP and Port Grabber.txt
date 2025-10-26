@@ -1,0 +1,188 @@
+(() => {
+  // Helper to detect if IP is local/private
+  function isLocalIP(ip) {
+    return (
+      ip.startsWith('10.') ||
+      ip.startsWith('192.168.') ||
+      (ip.startsWith('172.') && (() => {
+        const second = parseInt(ip.split('.')[1]);
+        return second >= 16 && second <= 31;
+      })()) ||
+      ip === '127.0.0.1' ||
+      ip === '::1' ||
+      ip.startsWith('fc') || ip.startsWith('fd')
+    );
+  }
+
+  const data = {
+    remoteIPs: new Set(),
+    iceCandidates: [],
+    dataChannelMessages: [],
+  };
+
+  // Create UI
+  const btn = document.createElement('button');
+  btn.textContent = 'Show Remote Peers Info';
+  Object.assign(btn.style, {
+    position: 'fixed', top: '10px', right: '10px', zIndex: 999999,
+    padding: '10px 15px', background: 'rgba(185,43,43,0.9)', color: 'white',
+    border: 'none', borderRadius: '5px', cursor: 'pointer',
+    fontWeight: 'bold', boxShadow: '0 0 10px rgba(185,43,43,0.8)', fontFamily: 'Arial, sans-serif',
+  });
+
+  const panel = document.createElement('div');
+  Object.assign(panel.style, {
+    position: 'fixed', top: '50px', right: '10px', width: '420px', maxHeight: '500px',
+    overflowY: 'auto', background: 'rgba(30,30,30,0.95)', color: '#eee',
+    fontFamily: 'Consolas, monospace', fontSize: '12px', padding: '10px',
+    borderRadius: '8px', boxShadow: '0 0 15px rgba(185,43,43,0.8)', zIndex: 999998,
+    display: 'none',
+  });
+
+  const title = document.createElement('div');
+  title.textContent = 'Remote Peer Connection Info';
+  Object.assign(title.style, {
+    fontWeight: 'bold', fontSize: '14px', marginBottom: '8px',
+  });
+  panel.appendChild(title);
+
+  const content = document.createElement('pre');
+  content.textContent = 'No remote peer info collected yet...';
+  panel.appendChild(content);
+
+  document.body.appendChild(btn);
+  document.body.appendChild(panel);
+
+  function updateContent() {
+    let text = '';
+
+    // Show ICE Candidates - only remote
+    text += '=== ICE Candidates (REMOTE ONLY) ===\n';
+    const remoteCandidates = data.iceCandidates.filter(c => !c.isLocal);
+    if (remoteCandidates.length === 0) {
+      text += 'No remote ICE candidates yet.\n';
+    } else {
+      remoteCandidates.forEach((c, i) => {
+        text += `[${i + 1}] Type:${c.type} IP:${c.ip} Protocol:${c.protocol} Port:${c.port}\n`;
+      });
+    }
+    text += '\n';
+
+    // Show remote IPs
+    text += '=== Remote IPs ===\n';
+    if (data.remoteIPs.size === 0) {
+      text += 'No remote IPs found.\n';
+    } else {
+      data.remoteIPs.forEach(ip => {
+        text += ip + '\n';
+      });
+    }
+    text += '\n';
+
+    // Show DataChannel Messages
+    text += '=== DataChannel Messages (REMOTE ONLY) ===\n';
+    if (data.dataChannelMessages.length === 0) {
+      text += 'No DataChannel messages received from remote peers.\n';
+    } else {
+      data.dataChannelMessages.forEach((msg, i) => {
+        text += `[${i + 1}] ${msg}\n`;
+      });
+    }
+
+    content.textContent = text;
+  }
+
+  // Hook RTCPeerConnection constructor
+  const OriginalRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+
+  if (!OriginalRTCPeerConnection) {
+    alert('WebRTC not supported in this browser');
+    return;
+  }
+
+  window.RTCPeerConnection = function (...args) {
+    const pc = new OriginalRTCPeerConnection(...args);
+
+    // Hook setLocalDescription — typically local candidates, so ignore local IPs
+    const origSetLocalDescription = pc.setLocalDescription.bind(pc);
+    pc.setLocalDescription = function (description) {
+      if (description && description.sdp) {
+        const lines = description.sdp.split('\n');
+        lines.forEach(line => {
+          if (line.indexOf('candidate') >= 0) {
+            const parts = line.split(' ');
+            const ip = parts[4];
+            if (!ip) return;
+            if (!isLocalIP(ip)) {
+              const protocol = parts[2];
+              const port = parts[5];
+              const typeIndex = parts.indexOf('typ');
+              const type = (typeIndex !== -1) ? parts[typeIndex + 1] : 'unknown';
+              // mark local false so it is remote
+              data.remoteIPs.add(ip);
+              data.iceCandidates.push({ type, ip, protocol, port, isLocal: false });
+              updateContent();
+            }
+          }
+        });
+      }
+      return origSetLocalDescription(description);
+    };
+
+    // Hook addIceCandidate — this is remote peer candidate, filter local IPs out
+    const origAddIceCandidate = pc.addIceCandidate.bind(pc);
+    pc.addIceCandidate = function (candidate, ...rest) {
+      if (candidate && candidate.candidate) {
+        const parts = candidate.candidate.split(' ');
+        const ip = parts[4];
+        if (!ip) return origAddIceCandidate(candidate, ...rest);
+        if (!isLocalIP(ip)) {
+          const protocol = parts[2];
+          const port = parts[5];
+          const typeIndex = parts.indexOf('typ');
+          const type = (typeIndex !== -1) ? parts[typeIndex + 1] : 'unknown';
+          data.remoteIPs.add(ip);
+          data.iceCandidates.push({ type, ip, protocol, port, isLocal: false });
+          updateContent();
+        }
+      }
+      return origAddIceCandidate(candidate, ...rest);
+    };
+
+    // Hook createDataChannel (outgoing)
+    const origCreateDataChannel = pc.createDataChannel.bind(pc);
+    pc.createDataChannel = function (label, options) {
+      const dc = origCreateDataChannel(label, options);
+      dc.addEventListener('message', e => {
+        data.dataChannelMessages.push(`[${label}] ${e.data}`);
+        updateContent();
+      });
+      return dc;
+    };
+
+    // Hook incoming data channels
+    pc.addEventListener('datachannel', e => {
+      const dc = e.channel;
+      dc.addEventListener('message', ev => {
+        data.dataChannelMessages.push(`[RemoteChannel] ${ev.data}`);
+        updateContent();
+      });
+    });
+
+    return pc;
+  };
+
+  // Button toggle panel
+  btn.onclick = () => {
+    if (panel.style.display === 'none') {
+      updateContent();
+      panel.style.display = 'block';
+      btn.textContent = 'Hide Remote Peers Info';
+    } else {
+      panel.style.display = 'none';
+      btn.textContent = 'Show Remote Peers Info';
+    }
+  };
+
+  console.log('[*] Remote peer info grabber initialized. Click the red button to toggle info panel.');
+})();
